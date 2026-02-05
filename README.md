@@ -117,6 +117,9 @@ func main() {
 }
 ```
 
+---
+Generated with Codex.
+
 `LockConfig` fields:
 - `Policy` (`ReaderPreferred`, `WriterPreferred`, `FIFO`)
 - `RequestTimeout` (time to receive an offer)

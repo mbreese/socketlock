@@ -193,40 +193,47 @@ func TestFIFOOrdering(t *testing.T) {
 		t.Fatalf("acquire read: %v", err)
 	}
 
-	writerCh := make(chan *Lock, 1)
-	readerCh := make(chan *Lock, 1)
+	type lockResult struct {
+		lock *Lock
+		err  error
+	}
+	writerCh := make(chan lockResult, 1)
+	readerCh := make(chan lockResult, 1)
 
 	go func() {
 		lock, err := writerClient.AcquireWrite(ctx)
-		if err == nil {
-			writerCh <- lock
-			return
-		}
-		writerCh <- nil
+		writerCh <- lockResult{lock: lock, err: err}
 	}()
 
 	go func() {
 		lock, err := readerClient.AcquireRead(ctx)
-		if err == nil {
-			readerCh <- lock
-			return
-		}
-		readerCh <- nil
+		readerCh <- lockResult{lock: lock, err: err}
 	}()
 
 	if err := readLock.Release(); err != nil {
 		t.Fatalf("release read: %v", err)
 	}
 
-	writerLock := <-writerCh
-	if writerLock == nil {
+	writerRes := <-writerCh
+	if writerRes.err != nil || writerRes.lock == nil {
+		select {
+		case res := <-readerCh:
+			if res.lock != nil {
+				_ = res.lock.Release()
+			}
+		default:
+		}
+		if writerRes.err != nil {
+			t.Fatalf("writer failed to acquire: %v", writerRes.err)
+		}
 		t.Fatalf("writer failed to acquire")
 	}
+	writerLock := writerRes.lock
 
 	select {
-	case lock := <-readerCh:
-		if lock != nil {
-			lock.Release()
+	case res := <-readerCh:
+		if res.lock != nil {
+			_ = res.lock.Release()
 			t.Fatalf("reader acquired before writer released in FIFO")
 		}
 	case <-time.After(100 * time.Millisecond):
@@ -236,11 +243,14 @@ func TestFIFOOrdering(t *testing.T) {
 		t.Fatalf("release writer: %v", err)
 	}
 
-	readerLock := <-readerCh
-	if readerLock == nil {
+	readerRes := <-readerCh
+	if readerRes.err != nil || readerRes.lock == nil {
+		if readerRes.err != nil {
+			t.Fatalf("reader failed to acquire after writer released: %v", readerRes.err)
+		}
 		t.Fatalf("reader failed to acquire after writer released")
 	}
-	if err := readerLock.Release(); err != nil {
+	if err := readerRes.lock.Release(); err != nil {
 		t.Fatalf("release reader: %v", err)
 	}
 }

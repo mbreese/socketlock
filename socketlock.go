@@ -500,6 +500,10 @@ func (c *Client) failAllPending(err error) {
 	c.mu.Lock()
 	pending := c.pending
 	c.pending = nil
+	c.inFlight = false
+	if c.cond != nil {
+		c.cond.Broadcast()
+	}
 	c.mu.Unlock()
 	for _, req := range pending {
 		req.result <- acquireResult{err: err}
@@ -615,7 +619,7 @@ func (c *Client) waitForLocks() {
 	if c.cond == nil {
 		return
 	}
-	for len(c.locks) > 0 || c.inFlight {
+	for len(c.locks) > 0 {
 		c.cond.Wait()
 	}
 }

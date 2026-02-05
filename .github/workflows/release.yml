@@ -20,12 +20,9 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Build
-        run: make
+        run: make bin/socketlockd.darwin_amd64 bin/socketlockd.darwin_arm64 bin/socketlockd.linux_amd64 bin/socketlockd.linux_arm64
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            bin/socketlockd.darwin_amd64
-            bin/socketlockd.darwin_arm64
-            bin/socketlockd.linux_amd64
-            bin/socketlockd.linux_arm64
+            bin/socketlockd.*

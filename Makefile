@@ -10,13 +10,14 @@ all: socketlockd
 
 socketlockd: build
 
-build:
+build: $(GOOS_ARCHES:%=$(BIN_DIR)/$(APP).%)
+
+$(BIN_DIR)/$(APP).%:
 	@mkdir -p $(BIN_DIR)
 	@set -e; \
-	for target in $(GOOS_ARCHES); do \
-		GOOS=$${target%_*} GOARCH=$${target#*_} \
-		go build -trimpath -o $(BIN_DIR)/$(APP).$${GOOS}_$${GOARCH} $(PKG); \
-	done
+	target="$*"; \
+	GOOS=$${target%_*} GOARCH=$${target#*_} \
+	go build -trimpath -o $(BIN_DIR)/$(APP).$${GOOS}_$${GOARCH} $(PKG)
 
 clean:
 	@rm -rf $(BIN_DIR)

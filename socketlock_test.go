@@ -344,15 +344,14 @@ func TestSingleFlightEnforced(t *testing.T) {
 		t.Fatalf("acquire read: %v", err)
 	}
 
-	errCh := make(chan error, 1)
+	type lockResult struct {
+		lock *Lock
+		err  error
+	}
+	errCh := make(chan lockResult, 1)
 	go func() {
 		lock, err := blocker.AcquireWrite(ctx)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		_ = lock.Release()
-		errCh <- nil
+		errCh <- lockResult{lock: lock, err: err}
 	}()
 
 	time.Sleep(20 * time.Millisecond)
@@ -365,8 +364,84 @@ func TestSingleFlightEnforced(t *testing.T) {
 		t.Fatalf("release read: %v", err)
 	}
 
-	if err := <-errCh; err != nil {
-		t.Fatalf("expected writer to acquire after reader released: %v", err)
+	res := <-errCh
+	if res.err != nil {
+		t.Fatalf("expected writer to acquire after reader released: %v", res.err)
+	}
+	if res.lock != nil {
+		if err := res.lock.Release(); err != nil {
+			t.Fatalf("release writer: %v", err)
+		}
+	}
+}
+
+func TestReentrantRead(t *testing.T) {
+	path := newSocketPath(t)
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	client, err := Connect(ctx, path, LockConfig{
+		Policy:         FIFO,
+		RequestTimeout: 5 * time.Second,
+		ConfirmTimeout: time.Second,
+		MaxTTL:         0,
+		StatusInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	lock1, err := client.AcquireRead(ctx)
+	if err != nil {
+		t.Fatalf("acquire read: %v", err)
+	}
+
+	lock2, err := client.AcquireRead(ctx)
+	if err != nil {
+		t.Fatalf("acquire reentrant read: %v", err)
+	}
+
+	if err := lock1.Release(); err != nil {
+		t.Fatalf("release read: %v", err)
+	}
+	if err := lock2.Release(); err != nil {
+		t.Fatalf("release read: %v", err)
+	}
+}
+
+func TestReentrantWriteAllowsRead(t *testing.T) {
+	path := newSocketPath(t)
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	client, err := Connect(ctx, path, LockConfig{
+		Policy:         FIFO,
+		RequestTimeout: 5 * time.Second,
+		ConfirmTimeout: time.Second,
+		MaxTTL:         0,
+		StatusInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	lock1, err := client.AcquireWrite(ctx)
+	if err != nil {
+		t.Fatalf("acquire write: %v", err)
+	}
+
+	lock2, err := client.AcquireRead(ctx)
+	if err != nil {
+		t.Fatalf("acquire read under write: %v", err)
+	}
+
+	if err := lock2.Release(); err != nil {
+		t.Fatalf("release read: %v", err)
+	}
+	if err := lock1.Release(); err != nil {
+		t.Fatalf("release write: %v", err)
 	}
 }
 
@@ -421,7 +496,7 @@ func TestStatusLockTimeout(t *testing.T) {
 
 	deadline := time.Now().Add(2500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if lock.expired.Load() {
+		if lock.Expired() {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)

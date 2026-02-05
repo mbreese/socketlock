@@ -68,8 +68,8 @@ type Client struct {
 	inFlight     bool
 	closed       bool
 	lastActivity time.Time
-	locks        map[string]*Lock
 	cond         *sync.Cond
+	active       *lockState
 }
 
 // Connect returns a client connected to the primary at path.
@@ -162,6 +162,20 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 		c.mu.Unlock()
 		return nil, errors.New("socketlock: client is closed")
 	}
+	if c.active != nil {
+		if c.active.expired.Load() || c.active.released {
+			c.mu.Unlock()
+			return nil, errors.New("socketlock: lock expired")
+		}
+		if cmd == "REQWRITE" && c.active.mode == modeRead {
+			c.mu.Unlock()
+			return nil, errors.New("socketlock: write requested while read lock held")
+		}
+		c.active.count++
+		lock := &Lock{client: c, state: c.active}
+		c.mu.Unlock()
+		return lock, nil
+	}
 	if c.inFlight {
 		c.mu.Unlock()
 		return nil, errors.New("socketlock: multiple lock requests")
@@ -217,8 +231,22 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 		if err := c.sendConfirm(res.lockID); err != nil {
 			return nil, err
 		}
-		lock := &Lock{client: c, lockID: res.lockID, statusStop: make(chan struct{})}
-		c.registerLock(lock)
+		state := &lockState{
+			mode:       modeRead,
+			lockID:     res.lockID,
+			count:      1,
+			statusStop: make(chan struct{}),
+		}
+		if cmd == "REQWRITE" {
+			state.mode = modeWrite
+		}
+		c.mu.Lock()
+		c.active = state
+		if c.cond != nil {
+			c.cond.Broadcast()
+		}
+		c.mu.Unlock()
+		lock := &Lock{client: c, state: state}
 		lock.startStatusLoop()
 		return lock, nil
 	}
@@ -259,44 +287,55 @@ func (c *Client) sendEOL() {
 
 // Lock represents an acquired lock. Release sends a RELEASE command.
 type Lock struct {
-	client     *Client
-	lockID     string
-	once       sync.Once
-	statusStop chan struct{}
-	statusOnce sync.Once
-	expired    atomic.Bool
+	client *Client
+	state  *lockState
+	once   sync.Once
 }
 
 // Release relinquishes the lock.
 func (l *Lock) Release() error {
-	if l == nil || l.client == nil || l.lockID == "" {
+	if l == nil || l.client == nil || l.state == nil {
 		return nil
 	}
 	var err error
 	l.once.Do(func() {
-		err = l.client.releaseLock(l.lockID)
-		l.client.unregisterLock(l.lockID)
-		l.stopStatus()
+		err = l.client.releaseState(l.state)
 	})
 	return err
 }
 
-func (l *Lock) stopStatus() {
-	if l == nil {
-		return
+// Expired reports whether the lock is no longer active per STATUS checks.
+func (l *Lock) Expired() bool {
+	if l == nil || l.state == nil {
+		return true
 	}
-	l.statusOnce.Do(func() {
-		close(l.statusStop)
-	})
+	return l.state.expired.Load()
 }
 
-func (c *Client) releaseLock(lockID string) error {
+func (c *Client) releaseState(state *lockState) error {
+	if state == nil {
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return nil
 	}
-	return c.writeLineLocked(fmt.Sprintf("%s RELEASE %s\n", c.clientID, lockID))
+	if c.active != state {
+		return nil
+	}
+	if state.count > 1 {
+		state.count--
+		return nil
+	}
+	state.count = 0
+	state.released = true
+	close(state.statusStop)
+	c.active = nil
+	if c.cond != nil {
+		c.cond.Broadcast()
+	}
+	return c.writeLineLocked(fmt.Sprintf("%s RELEASE %s\n", c.clientID, state.lockID))
 }
 
 func (c *Client) writeLineLocked(line string) error {
@@ -317,6 +356,15 @@ type pendingRequest struct {
 type acquireResult struct {
 	lockID string
 	err    error
+}
+
+type lockState struct {
+	mode       lockMode
+	lockID     string
+	count      int
+	statusStop chan struct{}
+	expired    atomic.Bool
+	released   bool
 }
 
 func connectClient(ctx context.Context, path string, cfg LockConfig, srv *server) (*Client, error) {
@@ -343,7 +391,6 @@ func connectClient(ctx context.Context, path string, cfg LockConfig, srv *server
 		hbStop:         make(chan struct{}),
 		statusInterval: defaultStatusInterval(cfg.StatusInterval),
 		pending:        make([]*pendingRequest, 0, 4),
-		locks:          make(map[string]*Lock),
 	}
 	c.cond = sync.NewCond(&c.mu)
 	c.touchLocked()
@@ -438,40 +485,17 @@ func (c *Client) handleLine(line string) {
 			return
 		}
 		c.mu.Lock()
-		lock := c.locks[fields[2]]
-		delete(c.locks, fields[2])
-		if c.cond != nil {
-			c.cond.Broadcast()
+		state := c.active
+		if state != nil && state.lockID == fields[2] {
+			state.expired.Store(true)
+			state.released = true
+			close(state.statusStop)
+			c.active = nil
+			if c.cond != nil {
+				c.cond.Broadcast()
+			}
 		}
 		c.mu.Unlock()
-		if lock != nil {
-			lock.expired.Store(true)
-			lock.stopStatus()
-		}
-	}
-}
-
-func (c *Client) registerLock(lock *Lock) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.locks == nil {
-		c.locks = make(map[string]*Lock)
-	}
-	c.locks[lock.lockID] = lock
-	if c.cond != nil {
-		c.cond.Broadcast()
-	}
-}
-
-func (c *Client) unregisterLock(lockID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.locks == nil {
-		return
-	}
-	delete(c.locks, lockID)
-	if c.cond != nil {
-		c.cond.Broadcast()
 	}
 }
 
@@ -522,8 +546,10 @@ func (c *Client) closeConn() error {
 	conn := c.conn
 	c.conn = nil
 	close(c.hbStop)
-	for _, lock := range c.locks {
-		lock.stopStatus()
+	if c.active != nil {
+		c.active.released = true
+		close(c.active.statusStop)
+		c.active = nil
 	}
 	if c.cond != nil {
 		c.cond.Broadcast()
@@ -590,10 +616,10 @@ func (l *Lock) startStatusLoop() {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-l.statusStop:
+			case <-l.state.statusStop:
 				return
 			case <-ticker.C:
-				if l.expired.Load() {
+				if l.state.expired.Load() || l.state.released {
 					return
 				}
 				l.client.mu.Lock()
@@ -601,7 +627,7 @@ func (l *Lock) startStatusLoop() {
 					l.client.mu.Unlock()
 					return
 				}
-				_ = l.client.writeLineLocked(fmt.Sprintf("%s STATUS %s\n", l.client.clientID, l.lockID))
+				_ = l.client.writeLineLocked(fmt.Sprintf("%s STATUS %s\n", l.client.clientID, l.state.lockID))
 				l.client.mu.Unlock()
 			}
 		}
@@ -621,7 +647,7 @@ func (c *Client) waitForLocks() {
 	if c.cond == nil {
 		return
 	}
-	for len(c.locks) > 0 {
+	for c.active != nil {
 		c.cond.Wait()
 	}
 }

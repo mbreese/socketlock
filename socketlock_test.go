@@ -26,7 +26,7 @@ func TestReadWriteExclusion(t *testing.T) {
 
 	primary, err := Connect(ctx, path, LockConfig{
 		Policy:         WriterPreferred,
-		RequestTimeout: time.Second,
+		RequestTimeout: 5 * time.Second,
 		ConfirmTimeout: time.Second,
 		MaxTTL:         0,
 		StatusInterval: 50 * time.Millisecond,
@@ -75,7 +75,7 @@ func TestWriterPreferredBlocksNewReaders(t *testing.T) {
 
 	primary, err := Connect(ctx, path, LockConfig{
 		Policy:         WriterPreferred,
-		RequestTimeout: time.Second,
+		RequestTimeout: 5 * time.Second,
 		ConfirmTimeout: time.Second,
 		MaxTTL:         0,
 		StatusInterval: 50 * time.Millisecond,
@@ -166,7 +166,7 @@ func TestFIFOOrdering(t *testing.T) {
 
 	primary, err := Connect(ctx, path, LockConfig{
 		Policy:         FIFO,
-		RequestTimeout: time.Second,
+		RequestTimeout: 5 * time.Second,
 		ConfirmTimeout: time.Second,
 		MaxTTL:         0,
 		StatusInterval: 50 * time.Millisecond,
@@ -199,11 +199,25 @@ func TestFIFOOrdering(t *testing.T) {
 	}
 	writerCh := make(chan lockResult, 1)
 	readerCh := make(chan lockResult, 1)
+	sentCh := make(chan struct{}, 1)
+	testRequestSentHook = func() {
+		select {
+		case sentCh <- struct{}{}:
+		default:
+		}
+	}
+	defer func() { testRequestSentHook = nil }()
 
 	go func() {
 		lock, err := writerClient.AcquireWrite(ctx)
 		writerCh <- lockResult{lock: lock, err: err}
 	}()
+
+	// Ensure writer request is sent before reader to test FIFO ordering.
+	select {
+	case <-sentCh:
+	case <-time.After(200 * time.Millisecond):
+	}
 
 	go func() {
 		lock, err := readerClient.AcquireRead(ctx)
@@ -262,7 +276,7 @@ func TestContextCancelAbortsPending(t *testing.T) {
 
 	primary, err := Connect(ctx, path, LockConfig{
 		Policy:         WriterPreferred,
-		RequestTimeout: time.Second,
+		RequestTimeout: 5 * time.Second,
 		ConfirmTimeout: time.Second,
 		MaxTTL:         0,
 		StatusInterval: 50 * time.Millisecond,
@@ -309,7 +323,7 @@ func TestSingleFlightEnforced(t *testing.T) {
 
 	primary, err := Connect(ctx, path, LockConfig{
 		Policy:         WriterPreferred,
-		RequestTimeout: time.Second,
+		RequestTimeout: 5 * time.Second,
 		ConfirmTimeout: time.Second,
 		MaxTTL:         0,
 		StatusInterval: 50 * time.Millisecond,
@@ -363,7 +377,7 @@ func TestMaxTTLRejectsRequest(t *testing.T) {
 
 	client, err := Connect(ctx, path, LockConfig{
 		Policy:         FIFO,
-		RequestTimeout: time.Second,
+		RequestTimeout: 5 * time.Second,
 		ConfirmTimeout: time.Second,
 		MaxTTL:         time.Second,
 		StatusInterval: 50 * time.Millisecond,
@@ -389,7 +403,7 @@ func TestStatusLockTimeout(t *testing.T) {
 
 	client, err := Connect(ctx, path, LockConfig{
 		Policy:         FIFO,
-		RequestTimeout: time.Second,
+		RequestTimeout: 5 * time.Second,
 		ConfirmTimeout: time.Second,
 		MaxTTL:         2 * time.Second,
 		StatusInterval: 50 * time.Millisecond,

@@ -179,6 +179,7 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 			c.mu.Unlock()
 			return nil, err
 		}
+		callRequestSentHook()
 	} else {
 		if err := c.writeLineLocked(fmt.Sprintf("%s %s %s\n", c.clientID, cmd, req.lockID)); err != nil {
 			c.removePending(req)
@@ -186,6 +187,7 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 			c.mu.Unlock()
 			return nil, err
 		}
+		callRequestSentHook()
 	}
 	c.mu.Unlock()
 
@@ -672,3 +674,12 @@ func isAddrInUse(err error) bool {
 
 // Default timeout used by tests to avoid hangs.
 var testTimeout = 5 * time.Second
+
+// testRequestSentHook is set by tests to observe when a request is sent.
+var testRequestSentHook func()
+
+func callRequestSentHook() {
+	if testRequestSentHook != nil {
+		testRequestSentHook()
+	}
+}

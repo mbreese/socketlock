@@ -187,7 +187,7 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 		if seconds <= 0 {
 			seconds = 1
 		}
-		if err := c.writeLineLocked(fmt.Sprintf("%s %s %s %d\n", c.clientID, cmd, req.lockID, seconds)); err != nil {
+		if err := c.sendRequestLocked(cmd, req.lockID, seconds); err != nil {
 			c.removePending(req)
 			c.inFlight = false
 			c.mu.Unlock()
@@ -195,7 +195,7 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 		}
 		callRequestSentHook()
 	} else {
-		if err := c.writeLineLocked(fmt.Sprintf("%s %s %s\n", c.clientID, cmd, req.lockID)); err != nil {
+		if err := c.sendRequestLocked(cmd, req.lockID, 0); err != nil {
 			c.removePending(req)
 			c.inFlight = false
 			c.mu.Unlock()
@@ -258,7 +258,7 @@ func (c *Client) sendConfirm(lockID string) error {
 	if c.closed {
 		return errors.New("socketlock: client is closed")
 	}
-	return c.writeLineLocked(fmt.Sprintf("%s CONFIRM %s\n", c.clientID, lockID))
+	return c.sendConfirmLocked(lockID)
 }
 
 func (c *Client) sendReject(req *pendingRequest) error {
@@ -273,7 +273,7 @@ func (c *Client) sendReject(req *pendingRequest) error {
 	if req.lockID == "" {
 		return errors.New("socketlock: reject requires lock id")
 	}
-	return c.writeLineLocked(fmt.Sprintf("%s REJECT %s\n", c.clientID, req.lockID))
+	return c.sendRejectLocked(req.lockID)
 }
 
 func (c *Client) sendEOL() {
@@ -282,7 +282,7 @@ func (c *Client) sendEOL() {
 	if c.closed || c.conn == nil {
 		return
 	}
-	_, _ = c.conn.Write([]byte(fmt.Sprintf("%s EOL\n", c.clientID)))
+	_ = c.sendEOLLocked()
 }
 
 // Lock represents an acquired lock. Release sends a RELEASE command.
@@ -335,7 +335,7 @@ func (c *Client) releaseState(state *lockState) error {
 	if c.cond != nil {
 		c.cond.Broadcast()
 	}
-	return c.writeLineLocked(fmt.Sprintf("%s RELEASE %s\n", c.clientID, state.lockID))
+	return c.sendReleaseLocked(state.lockID)
 }
 
 func (c *Client) writeLineLocked(line string) error {
@@ -345,6 +345,37 @@ func (c *Client) writeLineLocked(line string) error {
 	c.lastActivity = time.Now()
 	_, err := c.conn.Write([]byte(line))
 	return err
+}
+
+func (c *Client) sendRequestLocked(cmd, lockID string, ttlSeconds int64) error {
+	if ttlSeconds > 0 {
+		return c.writeLineLocked(fmt.Sprintf("%s %s %s %d\n", c.clientID, cmd, lockID, ttlSeconds))
+	}
+	return c.writeLineLocked(fmt.Sprintf("%s %s %s\n", c.clientID, cmd, lockID))
+}
+
+func (c *Client) sendConfirmLocked(lockID string) error {
+	return c.writeLineLocked(fmt.Sprintf("%s CONFIRM %s\n", c.clientID, lockID))
+}
+
+func (c *Client) sendRejectLocked(lockID string) error {
+	return c.writeLineLocked(fmt.Sprintf("%s REJECT %s\n", c.clientID, lockID))
+}
+
+func (c *Client) sendReleaseLocked(lockID string) error {
+	return c.writeLineLocked(fmt.Sprintf("%s RELEASE %s\n", c.clientID, lockID))
+}
+
+func (c *Client) sendStatusLocked(lockID string) error {
+	return c.writeLineLocked(fmt.Sprintf("%s STATUS %s\n", c.clientID, lockID))
+}
+
+func (c *Client) sendPingLocked() error {
+	return c.writeLineLocked(fmt.Sprintf("%s PING\n", c.clientID))
+}
+
+func (c *Client) sendEOLLocked() error {
+	return c.writeLineLocked(fmt.Sprintf("%s EOL\n", c.clientID))
 }
 
 type pendingRequest struct {
@@ -409,10 +440,11 @@ func (c *Client) sendHello() error {
 	if c.closed {
 		return errors.New("socketlock: client is closed")
 	}
-	if err := c.writeLineLocked(fmt.Sprintf("%s HELLO\n", c.clientID)); err != nil {
-		return err
-	}
-	return nil
+	return c.sendHelloLocked()
+}
+
+func (c *Client) sendHelloLocked() error {
+	return c.writeLineLocked(fmt.Sprintf("%s HELLO\n", c.clientID))
 }
 
 func (c *Client) readLoop() {
@@ -545,7 +577,7 @@ func (c *Client) closeConn() error {
 	c.closed = true
 	conn := c.conn
 	if c.active != nil && conn != nil {
-		_, _ = conn.Write([]byte(fmt.Sprintf("%s RELEASE %s\n", c.clientID, c.active.lockID)))
+		_ = c.sendReleaseLocked(c.active.lockID)
 		c.active.released = true
 		close(c.active.statusStop)
 		c.active = nil
@@ -628,7 +660,7 @@ func (l *Lock) startStatusLoop() {
 					l.client.mu.Unlock()
 					return
 				}
-				_ = l.client.writeLineLocked(fmt.Sprintf("%s STATUS %s\n", l.client.clientID, l.state.lockID))
+				_ = l.client.sendStatusLocked(l.state.lockID)
 				l.client.mu.Unlock()
 			}
 		}
@@ -687,7 +719,7 @@ func (c *Client) heartbeatLoop() {
 				c.mu.Unlock()
 				continue
 			}
-			_ = c.writeLineLocked(fmt.Sprintf("%s PING\n", c.clientID))
+			_ = c.sendPingLocked()
 			c.mu.Unlock()
 		}
 	}

@@ -544,13 +544,14 @@ func (c *Client) closeConn() error {
 	}
 	c.closed = true
 	conn := c.conn
-	c.conn = nil
-	close(c.hbStop)
-	if c.active != nil {
+	if c.active != nil && conn != nil {
+		_, _ = conn.Write([]byte(fmt.Sprintf("%s RELEASE %s\n", c.clientID, c.active.lockID)))
 		c.active.released = true
 		close(c.active.statusStop)
 		c.active = nil
 	}
+	c.conn = nil
+	close(c.hbStop)
 	if c.cond != nil {
 		c.cond.Broadcast()
 	}

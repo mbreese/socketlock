@@ -48,6 +48,7 @@ type LockConfig struct {
 	StatusInterval time.Duration
 	Heartbeat      time.Duration
 	ClientID       string
+	OnEvent        func(Event)
 }
 
 // Client connects to a socketlock primary and acquires locks.
@@ -58,6 +59,8 @@ type Client struct {
 	server     *server
 	conn       net.Conn
 	readerDone chan struct{}
+	readerOn   bool
+	connected  chan struct{}
 	heartbeat  time.Duration
 	hbStop     chan struct{}
 
@@ -98,7 +101,7 @@ func Connect(ctx context.Context, path string, cfg LockConfig) (*Client, error) 
 			conn, dialErr := dialer.DialContext(ctx, "unix", path)
 			if dialErr == nil {
 				conn.Close()
-				return &Client{path: path}, nil
+				return connectClient(ctx, path, cfg, nil)
 			}
 			// Stale socket; remove and retry.
 			_ = os.Remove(path)
@@ -136,11 +139,11 @@ func (c *Client) Close() error {
 
 // AcquireWrite acquires a write lock.
 func (c *Client) AcquireWrite(ctx context.Context) (*Lock, error) {
-	return c.acquire(ctx, "REQWRITE")
+	return c.acquire(ctx, cmdReqWrite)
 }
 
 func (c *Client) AcquireRead(ctx context.Context) (*Lock, error) {
-	return c.acquire(ctx, "REQREAD")
+	return c.acquire(ctx, cmdReqRead)
 }
 
 func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
@@ -167,7 +170,7 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 			c.mu.Unlock()
 			return nil, errors.New("socketlock: lock expired")
 		}
-		if cmd == "REQWRITE" && c.active.mode == modeRead {
+		if cmd == cmdReqWrite && c.active.mode == modeRead {
 			c.mu.Unlock()
 			return nil, errors.New("socketlock: write requested while read lock held")
 		}
@@ -188,7 +191,7 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 			seconds = 1
 		}
 		if err := c.sendRequestLocked(cmd, req.lockID, seconds); err != nil {
-			c.removePending(req)
+			c.removePendingLocked(req)
 			c.inFlight = false
 			c.mu.Unlock()
 			return nil, err
@@ -196,7 +199,7 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 		callRequestSentHook()
 	} else {
 		if err := c.sendRequestLocked(cmd, req.lockID, 0); err != nil {
-			c.removePending(req)
+			c.removePendingLocked(req)
 			c.inFlight = false
 			c.mu.Unlock()
 			return nil, err
@@ -208,7 +211,7 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 	select {
 	case <-ctx.Done():
 		c.mu.Lock()
-		c.removePending(req)
+		c.removePendingLocked(req)
 		c.inFlight = false
 		if c.cond != nil {
 			c.cond.Broadcast()
@@ -237,7 +240,7 @@ func (c *Client) acquire(ctx context.Context, cmd string) (*Lock, error) {
 			count:      1,
 			statusStop: make(chan struct{}),
 		}
-		if cmd == "REQWRITE" {
+		if cmd == cmdReqWrite {
 			state.mode = modeWrite
 		}
 		c.mu.Lock()
@@ -355,27 +358,27 @@ func (c *Client) sendRequestLocked(cmd, lockID string, ttlSeconds int64) error {
 }
 
 func (c *Client) sendConfirmLocked(lockID string) error {
-	return c.writeLineLocked(fmt.Sprintf("%s CONFIRM %s\n", c.clientID, lockID))
+	return c.writeLineLocked(fmt.Sprintf("%s %s %s\n", c.clientID, cmdConfirm, lockID))
 }
 
 func (c *Client) sendRejectLocked(lockID string) error {
-	return c.writeLineLocked(fmt.Sprintf("%s REJECT %s\n", c.clientID, lockID))
+	return c.writeLineLocked(fmt.Sprintf("%s %s %s\n", c.clientID, cmdReject, lockID))
 }
 
 func (c *Client) sendReleaseLocked(lockID string) error {
-	return c.writeLineLocked(fmt.Sprintf("%s RELEASE %s\n", c.clientID, lockID))
+	return c.writeLineLocked(fmt.Sprintf("%s %s %s\n", c.clientID, cmdRelease, lockID))
 }
 
 func (c *Client) sendStatusLocked(lockID string) error {
-	return c.writeLineLocked(fmt.Sprintf("%s STATUS %s\n", c.clientID, lockID))
+	return c.writeLineLocked(fmt.Sprintf("%s %s %s\n", c.clientID, cmdStatus, lockID))
 }
 
 func (c *Client) sendPingLocked() error {
-	return c.writeLineLocked(fmt.Sprintf("%s PING\n", c.clientID))
+	return c.writeLineLocked(fmt.Sprintf("%s %s\n", c.clientID, cmdPing))
 }
 
 func (c *Client) sendEOLLocked() error {
-	return c.writeLineLocked(fmt.Sprintf("%s EOL\n", c.clientID))
+	return c.writeLineLocked(fmt.Sprintf("%s %s\n", c.clientID, cmdEOL))
 }
 
 type pendingRequest struct {
@@ -399,10 +402,7 @@ type lockState struct {
 }
 
 func connectClient(ctx context.Context, path string, cfg LockConfig, srv *server) (*Client, error) {
-	clientID := cfg.ClientID
-	if strings.TrimSpace(clientID) == "" {
-		clientID = newClientID()
-	}
+	clientID := ""
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", path)
 	if err != nil {
@@ -418,6 +418,7 @@ func connectClient(ctx context.Context, path string, cfg LockConfig, srv *server
 		server:         srv,
 		conn:           conn,
 		readerDone:     make(chan struct{}),
+		connected:      make(chan struct{}),
 		heartbeat:      defaultHeartbeat(cfg.Heartbeat),
 		hbStop:         make(chan struct{}),
 		statusInterval: defaultStatusInterval(cfg.StatusInterval),
@@ -430,7 +431,12 @@ func connectClient(ctx context.Context, path string, cfg LockConfig, srv *server
 		return nil, err
 	}
 	go c.readLoop()
+	c.readerOn = true
 	go c.heartbeatLoop()
+	if err := c.waitForConnected(ctx); err != nil {
+		_ = c.closeConn()
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -444,7 +450,7 @@ func (c *Client) sendHello() error {
 }
 
 func (c *Client) sendHelloLocked() error {
-	return c.writeLineLocked(fmt.Sprintf("%s HELLO\n", c.clientID))
+	return c.writeLineLocked(fmt.Sprintf("%s\n", cmdHello))
 }
 
 func (c *Client) readLoop() {
@@ -468,11 +474,24 @@ func (c *Client) handleLine(line string) {
 	if len(fields) < 2 {
 		return
 	}
+	if fields[0] == respConnected {
+		c.mu.Lock()
+		if c.clientID == "" && len(fields) >= 2 {
+			c.clientID = fields[1]
+		}
+		select {
+		case <-c.connected:
+		default:
+			close(c.connected)
+		}
+		c.mu.Unlock()
+		return
+	}
 	if fields[0] != c.clientID {
 		return
 	}
 	switch fields[1] {
-	case "REQFAIL":
+	case respReqFail:
 		req := c.popPending()
 		if req == nil {
 			return
@@ -488,10 +507,10 @@ func (c *Client) handleLine(line string) {
 			msg = strings.Join(fields[2:], " ")
 		}
 		if msg == "" {
-			msg = "request failed"
+			msg = failRequestFailed
 		}
 		req.result <- acquireResult{err: errors.New("socketlock: " + msg)}
-	case "READLOCK", "WRITELOCK":
+	case respReadLock, respWriteLock:
 		if len(fields) < 3 {
 			return
 		}
@@ -507,12 +526,12 @@ func (c *Client) handleLine(line string) {
 		c.mu.Unlock()
 		req.lockID = fields[2]
 		req.result <- acquireResult{lockID: fields[2]}
-	case "LOCKOK":
+	case respLockOK:
 		if len(fields) < 3 {
 			return
 		}
 		// no-op, status is healthy
-	case "LOCKTIMEOUT":
+	case respLockTimeout:
 		if len(fields) < 3 {
 			return
 		}
@@ -542,7 +561,7 @@ func (c *Client) popPending() *pendingRequest {
 	return req
 }
 
-func (c *Client) removePending(target *pendingRequest) {
+func (c *Client) removePendingLocked(target *pendingRequest) {
 	if target == nil {
 		return
 	}
@@ -591,7 +610,9 @@ func (c *Client) closeConn() error {
 	if conn != nil {
 		_ = conn.Close()
 	}
-	<-c.readerDone
+	if c.readerOn {
+		<-c.readerDone
+	}
 	return nil
 }
 
@@ -682,6 +703,18 @@ func (c *Client) waitForLocks() {
 	}
 	for c.active != nil {
 		c.cond.Wait()
+	}
+}
+
+func (c *Client) waitForConnected(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-c.connected:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

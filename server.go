@@ -20,16 +20,18 @@ type server struct {
 	requestTimeout time.Duration
 	confirmTimeout time.Duration
 	maxTTL         time.Duration
+	onEvent        func(Event)
 }
 
 func newServer(listener net.Listener, cfg LockConfig) *server {
 	return &server{
 		listener:       listener,
-		manager:        newLockManager(cfg.Policy),
+		manager:        newLockManager(cfg.Policy, cfg.OnEvent),
 		stopCh:         make(chan struct{}),
 		requestTimeout: defaultTimeout(cfg.RequestTimeout),
 		confirmTimeout: defaultTimeout(cfg.ConfirmTimeout),
 		maxTTL:         cfg.MaxTTL,
+		onEvent:        cfg.OnEvent,
 	}
 }
 
@@ -72,20 +74,38 @@ func (s *server) serve() {
 	}
 }
 
+func (s *server) emit(ev Event) {
+	if s.onEvent == nil {
+		return
+	}
+	ev.Time = time.Now()
+	go s.onEvent(ev)
+}
+
 func (s *server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
 	reqs := make(map[string]*request)
 	var reqsMu sync.Mutex
+	var clientID string
+	var loggedDisconnect bool
 
 	closeCh := make(chan struct{})
 	go func() {
 		<-closeCh
 		reqsMu.Lock()
-		defer reqsMu.Unlock()
+		pending := make([]*request, 0, len(reqs))
 		for _, req := range reqs {
+			pending = append(pending, req)
+		}
+		reqsMu.Unlock()
+		for _, req := range pending {
 			s.manager.onConnClosed(req)
+		}
+		if clientID != "" && !loggedDisconnect {
+			loggedDisconnect = true
+			s.emit(Event{Type: EventClientDisconnected, ClientID: clientID})
 		}
 	}()
 
@@ -98,39 +118,83 @@ func (s *server) handleConn(conn net.Conn) {
 			close(closeCh)
 			return
 		}
-		clientID, cmd, arg, parseErr := parseCommand(line)
+		trimmed := strings.TrimSpace(line)
+		if trimmed == cmdHello {
+			if clientID == "" {
+				clientID = newClientID()
+			}
+			s.emit(Event{Type: EventHello, ClientID: clientID})
+			s.emit(Event{Type: EventClientConnected, ClientID: clientID})
+			s.emit(Event{Type: EventConnected, ClientID: clientID})
+			reply := fmt.Sprintf("%s %s\n", respConnected, clientID)
+			_, _ = conn.Write([]byte(reply))
+			continue
+		}
+
+		cid, cmd, arg, parseErr := parseCommand(line)
 		if parseErr != nil {
+			continue
+		}
+		if clientID != "" && cid != clientID {
+			continue
+		}
+		if clientID == "" {
 			continue
 		}
 
 		switch cmd {
-		case "HELLO":
-			line := fmt.Sprintf("%s CONNECTED\n", clientID)
-			_, _ = conn.Write([]byte(line))
-		case "EOL":
+		case cmdHello:
+			s.emit(Event{Type: EventHello, ClientID: clientID})
+			s.emit(Event{Type: EventClientConnected, ClientID: clientID})
+			s.emit(Event{Type: EventConnected, ClientID: clientID})
+			reply := fmt.Sprintf("%s %s\n", respConnected, clientID)
+			_, _ = conn.Write([]byte(reply))
+		case cmdEOL:
 			close(closeCh)
 			return
-		case "REQREAD", "REQWRITE":
+		case cmdReqRead, cmdReqWrite:
 			mode := modeRead
-			if cmd == "REQWRITE" {
+			if cmd == cmdReqWrite {
 				mode = modeWrite
 			}
 			lockID, ttl, ttlErr := parseLockAndTTL(arg)
 			if ttlErr != nil {
-				sendFail(&request{clientID: clientID, conn: conn}, "invalid ttl")
+				s.emit(Event{
+					Type:     EventRequestFailed,
+					ClientID: cid,
+					LockID:   lockID,
+					Mode:     modeString(mode),
+					TTL:      ttl,
+					Reason:   failInvalidTTL,
+				})
+				sendFail(&request{clientID: cid, conn: conn}, failInvalidTTL)
 				continue
 			}
 			if lockID == "" {
-				sendFail(&request{clientID: clientID, conn: conn}, "invalid lock id")
+				s.emit(Event{
+					Type:     EventRequestFailed,
+					ClientID: cid,
+					Mode:     modeString(mode),
+					Reason:   failInvalidLockID,
+				})
+				sendFail(&request{clientID: cid, conn: conn}, failInvalidLockID)
 				continue
 			}
 			if ttl > 0 && s.maxTTL > 0 && ttl > s.maxTTL {
-				sendFail(&request{clientID: clientID, conn: conn}, "timeout too long")
+				s.emit(Event{
+					Type:     EventRequestFailed,
+					ClientID: cid,
+					LockID:   lockID,
+					Mode:     modeString(mode),
+					TTL:      ttl,
+					Reason:   failTimeoutTooLong,
+				})
+				sendFail(&request{clientID: cid, conn: conn}, failTimeoutTooLong)
 				continue
 			}
 			req := &request{
 				mode:           mode,
-				clientID:       clientID,
+				clientID:       cid,
 				lockID:         lockID,
 				conn:           conn,
 				requestTimeout: s.requestTimeout,
@@ -147,8 +211,15 @@ func (s *server) handleConn(conn net.Conn) {
 				delete(reqs, r.lockID)
 				reqsMu.Unlock()
 			}
+			s.emit(Event{
+				Type:     EventLockRequested,
+				ClientID: cid,
+				LockID:   lockID,
+				Mode:     modeString(mode),
+				TTL:      ttl,
+			})
 			s.manager.enqueue(req)
-		case "CONFIRM":
+		case cmdConfirm:
 			if arg == "" {
 				continue
 			}
@@ -158,9 +229,10 @@ func (s *server) handleConn(conn net.Conn) {
 			if req != nil {
 				s.manager.confirm(req)
 			} else {
-				sendFail(&request{clientID: clientID, conn: conn}, "invalid lock id")
+				s.emit(Event{Type: EventRequestFailed, ClientID: cid, LockID: arg, Reason: failInvalidLockID})
+				sendFail(&request{clientID: cid, conn: conn}, failInvalidLockID)
 			}
-		case "RELEASE":
+		case cmdRelease:
 			if arg == "" {
 				continue
 			}
@@ -171,9 +243,10 @@ func (s *server) handleConn(conn net.Conn) {
 			if req != nil {
 				s.manager.release(req)
 			} else {
-				sendFail(&request{clientID: clientID, conn: conn}, "invalid lock id")
+				s.emit(Event{Type: EventRequestFailed, ClientID: cid, LockID: arg, Reason: failInvalidLockID})
+				sendFail(&request{clientID: cid, conn: conn}, failInvalidLockID)
 			}
-		case "REJECT":
+		case cmdReject:
 			if arg == "" {
 				continue
 			}
@@ -181,14 +254,24 @@ func (s *server) handleConn(conn net.Conn) {
 			req := reqs[arg]
 			reqsMu.Unlock()
 			if req != nil {
+				s.emit(Event{
+					Type:     EventLockRejected,
+					ClientID: cid,
+					LockID:   arg,
+					Mode:     modeString(req.mode),
+					Reason:   failOfferRejected,
+				})
 				s.manager.reject(req)
 			} else {
-				sendFail(&request{clientID: clientID, conn: conn}, "invalid lock id")
+				s.emit(Event{Type: EventRequestFailed, ClientID: cid, LockID: arg, Reason: failInvalidLockID})
+				sendFail(&request{clientID: cid, conn: conn}, failInvalidLockID)
 			}
-		case "PING":
-			line := fmt.Sprintf("%s PONG\n", clientID)
+		case cmdPing:
+			s.emit(Event{Type: EventPing, ClientID: cid})
+			line := fmt.Sprintf("%s %s\n", cid, respPong)
 			_, _ = conn.Write([]byte(line))
-		case "STATUS":
+			s.emit(Event{Type: EventPong, ClientID: cid})
+		case cmdStatus:
 			if arg == "" {
 				continue
 			}
@@ -196,17 +279,20 @@ func (s *server) handleConn(conn net.Conn) {
 			req := reqs[arg]
 			reqsMu.Unlock()
 			if req == nil || !req.confirmed {
-				line := fmt.Sprintf("%s LOCKTIMEOUT %s\n", clientID, arg)
+				s.emit(Event{Type: EventStatusTimeout, ClientID: cid, LockID: arg})
+				line := fmt.Sprintf("%s %s %s\n", cid, respLockTimeout, arg)
 				_, _ = conn.Write([]byte(line))
 				continue
 			}
 			if req.requestTTL > 0 && !req.expiresAt.IsZero() && time.Now().After(req.expiresAt) {
 				s.manager.release(req)
-				line := fmt.Sprintf("%s LOCKTIMEOUT %s\n", clientID, arg)
+				s.emit(Event{Type: EventStatusTimeout, ClientID: cid, LockID: arg})
+				line := fmt.Sprintf("%s %s %s\n", cid, respLockTimeout, arg)
 				_, _ = conn.Write([]byte(line))
 				continue
 			}
-			line := fmt.Sprintf("%s LOCKOK %s\n", clientID, arg)
+			s.emit(Event{Type: EventStatusOK, ClientID: cid, LockID: arg})
+			line := fmt.Sprintf("%s %s %s\n", cid, respLockOK, arg)
 			_, _ = conn.Write([]byte(line))
 		default:
 			continue
@@ -250,6 +336,17 @@ const (
 	modeWrite
 )
 
+func modeString(mode lockMode) string {
+	switch mode {
+	case modeRead:
+		return "read"
+	case modeWrite:
+		return "write"
+	default:
+		return "unknown"
+	}
+}
+
 type request struct {
 	mode           lockMode
 	clientID       string
@@ -276,10 +373,11 @@ type lockManager struct {
 	activeReaders int
 	activeWriter  bool
 	offered       *request
+	onEvent       func(Event)
 }
 
-func newLockManager(policy Policy) *lockManager {
-	return &lockManager{policy: policy}
+func newLockManager(policy Policy, onEvent func(Event)) *lockManager {
+	return &lockManager{policy: policy, onEvent: onEvent}
 }
 
 func (m *lockManager) enqueue(req *request) {
@@ -292,6 +390,14 @@ func (m *lockManager) enqueue(req *request) {
 	}
 	m.queue = append(m.queue, req)
 	m.tryGrant()
+}
+
+func (m *lockManager) emit(ev Event) {
+	if m.onEvent == nil {
+		return
+	}
+	ev.Time = time.Now()
+	go m.onEvent(ev)
 }
 
 func (m *lockManager) onConnClosed(req *request) {
@@ -369,33 +475,27 @@ func (m *lockManager) tryGrant() {
 }
 
 func (m *lockManager) grantReadersPreferred() {
-	// Grant all readers whenever no writer is active.
 	if len(m.queue) == 0 {
 		return
 	}
 
-	grantedAny := false
-	for i := 0; i < len(m.queue); {
-		req := m.queue[i]
+	// Prefer the first reader in queue.
+	for i, req := range m.queue {
 		if req.done {
-			m.queue = append(m.queue[:i], m.queue[i+1:]...)
 			continue
 		}
 		if req.mode == modeRead {
 			m.grantLocked(req)
 			m.queue = append(m.queue[:i], m.queue[i+1:]...)
-			grantedAny = true
+			return
+		}
+	}
+
+	// No readers pending; grant first writer in queue.
+	for i, req := range m.queue {
+		if req.done {
 			continue
 		}
-		i++
-	}
-
-	if m.activeReaders > 0 || grantedAny {
-		return
-	}
-
-	// No readers active or pending; grant first writer in queue.
-	for i, req := range m.queue {
 		if req.mode == modeWrite {
 			m.grantLocked(req)
 			m.queue = append(m.queue[:i], m.queue[i+1:]...)
@@ -410,6 +510,9 @@ func (m *lockManager) grantWriterPreferred() {
 	}
 
 	for i, req := range m.queue {
+		if req.done {
+			continue
+		}
 		if req.mode == modeWrite {
 			m.grantLocked(req)
 			m.queue = append(m.queue[:i], m.queue[i+1:]...)
@@ -417,15 +520,16 @@ func (m *lockManager) grantWriterPreferred() {
 		}
 	}
 
-	// No writers pending; grant all readers.
-	for i := 0; i < len(m.queue); {
-		req := m.queue[i]
+	// No writers pending; grant first reader.
+	for i, req := range m.queue {
+		if req.done {
+			continue
+		}
 		if req.mode == modeRead {
 			m.grantLocked(req)
 			m.queue = append(m.queue[:i], m.queue[i+1:]...)
-			continue
+			return
 		}
-		i++
 	}
 }
 
@@ -438,19 +542,12 @@ func (m *lockManager) grantFIFO() {
 	}
 
 	head := m.queue[0]
-	if head.mode == modeWrite {
-		m.grantLocked(head)
+	if head.done {
 		m.queue = m.queue[1:]
 		return
 	}
-
-	// Grant all consecutive readers at the front.
-	count := 0
-	for count < len(m.queue) && m.queue[count].mode == modeRead {
-		m.grantLocked(m.queue[count])
-		count++
-	}
-	m.queue = m.queue[count:]
+	m.grantLocked(head)
+	m.queue = m.queue[1:]
 }
 
 func (m *lockManager) grantLocked(req *request) {
@@ -465,7 +562,13 @@ func (m *lockManager) grantLocked(req *request) {
 		})
 	}
 	m.offered = req
-	sendGrant(req)
+	m.emit(Event{
+		Type:     EventLockOffered,
+		ClientID: req.clientID,
+		LockID:   req.lockID,
+		Mode:     modeString(req.mode),
+	})
+	sendGrantAsync(req)
 	close(req.grantedCh)
 }
 
@@ -486,7 +589,14 @@ func (m *lockManager) timeoutRequest(req *request) {
 	}
 	if !req.granted {
 		m.cancelLocked(req)
-		sendFail(req, "timeout waiting for lock")
+		m.emit(Event{
+			Type:     EventRequestFailed,
+			ClientID: req.clientID,
+			LockID:   req.lockID,
+			Mode:     modeString(req.mode),
+			Reason:   failTimeoutWaitLock,
+		})
+		sendFailAsync(req, failTimeoutWaitLock)
 	}
 }
 
@@ -498,7 +608,14 @@ func (m *lockManager) reject(req *request) {
 	}
 	if req.granted && !req.confirmed {
 		m.cancelLocked(req)
-		sendFail(req, "offer rejected")
+		m.emit(Event{
+			Type:     EventRequestFailed,
+			ClientID: req.clientID,
+			LockID:   req.lockID,
+			Mode:     modeString(req.mode),
+			Reason:   failOfferRejected,
+		})
+		sendFailAsync(req, failOfferRejected)
 	}
 }
 
@@ -519,6 +636,12 @@ func (m *lockManager) confirm(req *request) {
 	} else {
 		m.activeWriter = true
 	}
+	m.emit(Event{
+		Type:     EventLockConfirmed,
+		ClientID: req.clientID,
+		LockID:   req.lockID,
+		Mode:     modeString(req.mode),
+	})
 	m.tryGrant()
 }
 
@@ -529,6 +652,12 @@ func (m *lockManager) release(req *request) {
 		return
 	}
 	m.releaseLocked(req)
+	m.emit(Event{
+		Type:     EventLockReleased,
+		ClientID: req.clientID,
+		LockID:   req.lockID,
+		Mode:     modeString(req.mode),
+	})
 }
 
 func (m *lockManager) timeoutConfirm(req *request) {
@@ -538,19 +667,28 @@ func (m *lockManager) timeoutConfirm(req *request) {
 		return
 	}
 	m.cancelLocked(req)
-	sendFail(req, "timeout waiting for confirm")
+	m.emit(Event{
+		Type:     EventRequestFailed,
+		ClientID: req.clientID,
+		LockID:   req.lockID,
+		Mode:     modeString(req.mode),
+		Reason:   failTimeoutWaitConfirm,
+	})
+	sendFailAsync(req, failTimeoutWaitConfirm)
 }
 
-func sendGrant(req *request) {
+func sendGrantAsync(req *request) {
 	if req.conn == nil {
 		return
 	}
-	cmd := "READLOCK"
+	cmd := respReadLock
 	if req.mode == modeWrite {
-		cmd = "WRITELOCK"
+		cmd = respWriteLock
 	}
 	line := fmt.Sprintf("%s %s %s\n", req.clientID, cmd, req.lockID)
-	_, _ = req.conn.Write([]byte(line))
+	go func(conn net.Conn, payload string) {
+		_, _ = conn.Write([]byte(payload))
+	}(req.conn, line)
 }
 
 func sendFail(req *request, msg string) {
@@ -558,10 +696,23 @@ func sendFail(req *request, msg string) {
 		return
 	}
 	if strings.TrimSpace(msg) == "" {
-		msg = "request failed"
+		msg = failRequestFailed
 	}
-	line := fmt.Sprintf("%s REQFAIL %s\n", req.clientID, msg)
+	line := fmt.Sprintf("%s %s %s\n", req.clientID, respReqFail, msg)
 	_, _ = req.conn.Write([]byte(line))
+}
+
+func sendFailAsync(req *request, msg string) {
+	if req.conn == nil {
+		return
+	}
+	if strings.TrimSpace(msg) == "" {
+		msg = failRequestFailed
+	}
+	line := fmt.Sprintf("%s %s %s\n", req.clientID, respReqFail, msg)
+	go func(conn net.Conn, payload string) {
+		_, _ = conn.Write([]byte(payload))
+	}(req.conn, line)
 }
 
 func defaultTimeout(value time.Duration) time.Duration {

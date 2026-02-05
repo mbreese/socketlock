@@ -10,7 +10,7 @@ All protocol actions are initiated by clients; the server only responds.
 Each command is a single line, terminated by `\n`.
 
 **Client -> Server**
-- `<client-id> HELLO\n`
+- `HELLO\n`
 - `<client-id> REQREAD [seconds]\n`
 - `<client-id> REQWRITE [seconds]\n`
 - `<client-id> CONFIRM <lock-id>\n`
@@ -21,7 +21,7 @@ Each command is a single line, terminated by `\n`.
 - `<client-id> EOL\n`
 
 **Server -> Client**
-- `<client-id> CONNECTED\n`
+- `CONNECTED <client-id>\n`
 - `<client-id> READLOCK <lock-id>\n` (read lock offered)
 - `<client-id> WRITELOCK <lock-id>\n` (write lock offered)
 - `<client-id> REQFAIL <message>\n` (request failed)
@@ -31,7 +31,8 @@ Each command is a single line, terminated by `\n`.
 
 ## Semantics
 
-- Each process/node has an auto-generated instance ID (`client-id`) and includes it in every request (override via `LockConfig.ClientID`).
+- Each connection starts with `HELLO`. The server assigns a `client-id` and replies `CONNECTED <client-id>`.
+- Clients include the assigned `client-id` in every subsequent request.
 - Server replies always echo the **client's** `client-id` (not the primary's).
 - A request has a server-side time limit for waiting in the queue (default `30s`, configurable via `LockConfig.RequestTimeout`).
 - If a lock cannot be granted within the time limit, the server responds with `REQFAIL timeout waiting for lock`.
@@ -119,6 +120,27 @@ func main() {
 
 ---
 Generated with Codex.
+
+## socketlockd
+
+`socketlockd` runs a standalone server for debugging and inspection.
+
+Build:
+```bash
+make
+```
+
+Run:
+```bash
+./bin/socketlockd.darwin_amd64 -socket /tmp/locks.sock
+```
+
+Flags:
+- `-socket` unix socket path (required)
+- `-policy` `fifo|reader|writer` (default `fifo`)
+- `-request-timeout` (default `30s`)
+- `-confirm-timeout` (default `30s`)
+- `-max-ttl` (default `0`, unlimited)
 
 `LockConfig` fields:
 - `Policy` (`ReaderPreferred`, `WriterPreferred`, `FIFO`)

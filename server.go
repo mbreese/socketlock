@@ -606,6 +606,10 @@ func (m *lockManager) reject(req *request) {
 	if req.done {
 		return
 	}
+	if !req.granted {
+		m.cancelLocked(req)
+		return
+	}
 	if req.granted && !req.confirmed {
 		m.cancelLocked(req)
 		m.emit(Event{
